@@ -14,12 +14,14 @@ Acts as Socket.IO SERVER - KOTH Bot connects TO this plugin.
 Uses the existing socket.io package from SquadJS (no additional dependencies needed).
 
 v2 Changes:
-- Uses v2 JSON format (flat camelCase keys)
-- Periodic sync every 60 seconds during gameplay
+- Uses v2 JSON format (flat camelCase keys, single combined file)
+- Single JSON file per player containing player data + embedded tracking
+- Periodic sync every 60 seconds (includes tracking for crash protection)
 - Crash recovery on mount (scans for orphaned player files)
 - File deletion after successful disconnect sync
 - Handles server-hop wait-and-retry
 - syncSeq tracking for conflict resolution
+- Connect returns player data only (game builds tracking fresh)
 */
 
 import BasePlugin from './base-plugin.js';
@@ -134,6 +136,8 @@ export default class WsKothDB extends BasePlugin {
 
         this.io = null;
         this.kothPath = null;
+        this.playersPath = null;
+        this.configPath = null;
         this.kothBotSocket = null;
         this.authenticated = false;
         this.pendingRequests = new Map();
@@ -158,18 +162,24 @@ export default class WsKothDB extends BasePlugin {
             this.verbose(1, '='.repeat(60));
         }
 
-        // Resolve KOTH path
+        // Resolve KOTH paths
         this.kothPath = path.isAbsolute(this.options.kothFolderPath)
             ? this.options.kothFolderPath
             : path.resolve(process.cwd(), this.options.kothFolderPath);
 
-        this.verbose(1, `WsKothDB: Resolved KOTH path: ${this.kothPath}`);
+        // Subfolder structure:
+        // KOTH/
+        //   players/     - Player save files ({steamId}.json) - combined player + tracking data
+        //   config/      - Server config files (store.json, settings.json, etc.)
+        this.playersPath = path.join(this.kothPath, 'players');
+        this.configPath = path.join(this.kothPath, 'config');
 
-        // Check if KOTH folder exists
-        if (!fs.existsSync(this.kothPath)) {
-            this.verbose(1, `WsKothDB: WARNING - KOTH directory does not exist at ${this.kothPath}`);
-            this.verbose(1, 'WsKothDB: The game server should create this folder. Check your kothFolderPath config.');
-        }
+        this.verbose(1, `WsKothDB: Resolved KOTH path: ${this.kothPath}`);
+        this.verbose(1, `WsKothDB: Players path: ${this.playersPath}`);
+        this.verbose(1, `WsKothDB: Config path: ${this.configPath}`);
+
+        // Ensure directories exist
+        await this.ensureDirectories();
 
         // Start WebSocket server
         await this.startWebSocketServer();
@@ -298,9 +308,10 @@ export default class WsKothDB extends BasePlugin {
             this.verbose(1, `WsKothDB: Auth confirmed by KOTH Bot: ${data.serverName}`);
         });
 
-        // Player data response
+        // Player data response (player only - no tracking from DB)
+        // Game builds tracking fresh during gameplay session
         socket.on('player:data', async (data) => {
-            const { steamId, data: playerData, syncSeq } = data;
+            const { steamId, player: playerData, syncSeq } = data;
             this.verbose(2, `WsKothDB: Received player data for ${steamId} (seq: ${syncSeq})`);
 
             const pending = this.pendingRequests.get(steamId);
@@ -310,14 +321,26 @@ export default class WsKothDB extends BasePlugin {
                 pending.resolve({ playerData, syncSeq });
             }
 
-            // Write file and track player
+            // Write combined file with empty tracking (game will populate during session)
             if (playerData) {
-                await this.writePlayerJson(steamId, playerData);
-                this.activePlayers.set(steamId, {
-                    syncSeq: syncSeq || 0,
-                    lastSync: Date.now()
-                });
+                // Add empty tracking section if not present
+                const combinedData = {
+                    ...playerData,
+                    tracking: playerData.tracking || {
+                        kills: {},
+                        vehicleKills: {},
+                        purchases: {},
+                        weaponXp: {},
+                        rewards: {}
+                    }
+                };
+                await this.writePlayerJson(steamId, combinedData);
             }
+
+            this.activePlayers.set(steamId, {
+                syncSeq: syncSeq || 0,
+                lastSync: Date.now()
+            });
         });
 
         // Player wait (active elsewhere)
@@ -391,7 +414,7 @@ export default class WsKothDB extends BasePlugin {
             // Remove from active players
             this.activePlayers.delete(steamId);
 
-            // Delete the file if configured
+            // Delete player file (now contains tracking too) if configured
             if (this.options.deleteFileOnDisconnect) {
                 await this.deletePlayerJson(steamId);
             }
@@ -409,7 +432,7 @@ export default class WsKothDB extends BasePlugin {
             const { steamId, syncSeq, skipped, flagged } = data;
             this.verbose(1, `WsKothDB: Recovery ack for ${steamId}${skipped ? ' (skipped)' : ''}${flagged ? ' [FLAGGED]' : ''}`);
 
-            // Delete the recovered file
+            // Delete recovered file (combined format)
             await this.deletePlayerJson(steamId);
         });
 
@@ -457,6 +480,7 @@ export default class WsKothDB extends BasePlugin {
 
         for (const steamId of activeSteamIds) {
             try {
+                // Read combined JSON file (player + embedded tracking)
                 const playerData = await this.readPlayerJson(steamId);
                 if (!playerData) {
                     this.verbose(2, `WsKothDB: No file found for ${steamId}, skipping sync`);
@@ -475,9 +499,12 @@ export default class WsKothDB extends BasePlugin {
                 // Update file with new syncSeq
                 await this.writePlayerJson(steamId, playerData);
 
-                // Send to KOTH Bot
+                // Send full data to KOTH Bot (includes tracking for crash protection)
                 this.kothBotSocket.emit('player:sync', playerData);
-                this.verbose(2, `WsKothDB: Sent periodic sync for ${steamId} (seq: ${newSyncSeq})`);
+                const hasTracking = playerData.tracking && Object.keys(playerData.tracking).some(k =>
+                    playerData.tracking[k] && Object.keys(playerData.tracking[k]).length > 0
+                );
+                this.verbose(2, `WsKothDB: Sent periodic sync for ${steamId} (seq: ${newSyncSeq})${hasTracking ? ' +tracking' : ''}`);
 
             } catch (error) {
                 this.verbose(1, `WsKothDB: Periodic sync error for ${steamId}: ${error.message}`);
@@ -488,17 +515,16 @@ export default class WsKothDB extends BasePlugin {
     // ==================== Crash Recovery ====================
 
     async performCrashRecovery() {
-        if (!fs.existsSync(this.kothPath)) {
+        if (!fs.existsSync(this.playersPath)) {
             return;
         }
 
         this.verbose(1, 'WsKothDB: Checking for orphaned player files (crash recovery)');
 
         try {
-            const files = await readdir(this.kothPath);
+            const files = await readdir(this.playersPath);
             const playerFiles = files.filter(f =>
                 f.endsWith('.json') &&
-                f !== 'ServerSettings.json' &&
                 /^\d{17}\.json$/.test(f) // Steam ID format
             );
 
@@ -516,13 +542,14 @@ export default class WsKothDB extends BasePlugin {
                 return;
             }
 
-            // Collect all player data for batch recovery
+            // Collect all player data for batch recovery (combined format)
             const players = [];
 
             for (const file of playerFiles) {
                 const steamId = file.replace('.json', '');
 
                 try {
+                    // Read combined JSON file (player + embedded tracking)
                     const playerData = await this.readPlayerJson(steamId);
                     if (playerData && playerData.v === 2) {
                         players.push(playerData);
@@ -536,7 +563,7 @@ export default class WsKothDB extends BasePlugin {
 
             if (players.length > 0) {
                 this.kothBotSocket.emit('player:batch-crash-recovery', { players });
-                this.verbose(1, `WsKothDB: Sent ${players.length} players for crash recovery`);
+                this.verbose(1, `WsKothDB: Sent ${players.length} players for crash recovery (combined format)`);
             }
 
         } catch (error) {
@@ -558,7 +585,7 @@ export default class WsKothDB extends BasePlugin {
                 const result = await this.requestPlayerData(steamId, eosId, name);
 
                 if (result && result.playerData) {
-                    await this.writePlayerJson(steamId, result.playerData);
+                    // player:data handler already wrote the combined file
                     this.activePlayers.set(steamId, {
                         syncSeq: result.syncSeq || 0,
                         lastSync: Date.now()
@@ -586,10 +613,11 @@ export default class WsKothDB extends BasePlugin {
                 return;
             }
 
-            // Create default v2 save
+            // Create default v2 save (combined file with empty tracking)
             this.verbose(1, `WsKothDB: Creating default v2 save for ${steamId} (no connection)`);
             const defaultSave = this.createDefaultV2Save(steamId, eosId, name);
             await this.writePlayerJson(steamId, defaultSave);
+
             this.activePlayers.set(steamId, {
                 syncSeq: 0,
                 lastSync: Date.now()
@@ -598,9 +626,10 @@ export default class WsKothDB extends BasePlugin {
         } catch (error) {
             this.verbose(1, `WsKothDB: Error loading player ${steamId}: ${error.message}`);
 
-            // Create default on error
+            // Create default on error (combined file with empty tracking)
             const defaultSave = this.createDefaultV2Save(steamId, eosId, name);
             await this.writePlayerJson(steamId, defaultSave);
+
             this.activePlayers.set(steamId, {
                 syncSeq: 0,
                 lastSync: Date.now()
@@ -614,6 +643,7 @@ export default class WsKothDB extends BasePlugin {
         this.verbose(1, `WsKothDB: Player disconnected: ${steamId}`);
 
         try {
+            // Read combined JSON file (player + embedded tracking)
             const playerData = await this.readPlayerJson(steamId);
 
             if (!playerData) {
@@ -633,8 +663,12 @@ export default class WsKothDB extends BasePlugin {
             await this.writePlayerJson(steamId, playerData);
 
             if (this.isConnected()) {
+                // Send combined format (includes embedded tracking)
                 this.kothBotSocket.emit('player:disconnect', playerData);
-                this.verbose(1, `WsKothDB: Sent disconnect data for ${steamId} (seq: ${newSyncSeq})`);
+                const hasTracking = playerData.tracking && Object.keys(playerData.tracking).some(k =>
+                    playerData.tracking[k] && Object.keys(playerData.tracking[k]).length > 0
+                );
+                this.verbose(1, `WsKothDB: Sent disconnect data for ${steamId} (seq: ${newSyncSeq})${hasTracking ? ' +tracking' : ''}`);
             } else {
                 this.verbose(1, `WsKothDB: KOTH Bot unavailable, keeping file for ${steamId} (crash recovery)`);
                 this.activePlayers.delete(steamId);
@@ -679,8 +713,27 @@ export default class WsKothDB extends BasePlugin {
 
     // ==================== File Operations ====================
 
+    async ensureDirectories() {
+        const dirs = [this.kothPath, this.playersPath, this.configPath];
+
+        for (const dir of dirs) {
+            if (!fs.existsSync(dir)) {
+                if (this.options.dryRun) {
+                    this.verbose(1, `WsKothDB: [DRY RUN] Would create directory: ${dir}`);
+                } else {
+                    fs.mkdirSync(dir, { recursive: true });
+                    this.verbose(1, `WsKothDB: Created directory: ${dir}`);
+                }
+            }
+        }
+    }
+
     getPlayerFilePath(steamId) {
-        return path.join(this.kothPath, `${steamId}.json`);
+        return path.join(this.playersPath, `${steamId}.json`);
+    }
+
+    getConfigFilePath(filename) {
+        return path.join(this.configPath, filename);
     }
 
     async writePlayerJson(steamId, data) {
@@ -731,9 +784,41 @@ export default class WsKothDB extends BasePlugin {
         }
     }
 
+    // ==================== Config File Operations ====================
+
+    async writeConfigJson(filename, data) {
+        const filePath = this.getConfigFilePath(filename);
+
+        if (this.options.dryRun) {
+            this.verbose(1, `WsKothDB: [DRY RUN] Would write config file: ${filePath}`);
+            return;
+        }
+
+        await writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
+        this.verbose(2, `WsKothDB: Wrote config file: ${filePath}`);
+    }
+
+    async readConfigJson(filename) {
+        const filePath = this.getConfigFilePath(filename);
+
+        if (!fs.existsSync(filePath)) {
+            return null;
+        }
+
+        try {
+            const data = await readJsonSmart(filePath);
+            this.verbose(2, `WsKothDB: Read config file: ${filePath}`);
+            return data;
+        } catch (error) {
+            this.verbose(1, `WsKothDB: Error reading config file ${filePath}: ${error.message}`);
+            return null;
+        }
+    }
+
     // ==================== Utility Methods ====================
 
     createDefaultV2Save(steamId, eosId, name) {
+        // Combined file - player data + embedded tracking (empty)
         return {
             v: 2,
             steamId: steamId,
@@ -769,6 +854,7 @@ export default class WsKothDB extends BasePlugin {
             permaUnlocks: [],
             supporterStatus: [],
 
+            // Tracking data (game populates during session)
             tracking: {
                 kills: {},
                 vehicleKills: {},

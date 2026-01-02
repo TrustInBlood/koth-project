@@ -36,11 +36,13 @@ export function validateSteamId(steamId) {
 
 /**
  * Validate player data in v2 format.
+ * Validates the core player structure (stats, skins, loadout, perks, etc.).
+ * Tracking section (if present) is validated separately via validateV2TrackingFormat.
  *
  * @param {Object} data - Player data in v2 format
  * @returns {{valid: boolean, errors: string[]}}
  */
-export function validateV2Format(data) {
+export function validateV2PlayerFormat(data) {
     const errors = [];
 
     // Check top-level structure
@@ -126,16 +128,53 @@ export function validateV2Format(data) {
         }
     }
 
-    // Validate tracking object
-    if (data.tracking !== undefined) {
-        if (typeof data.tracking !== 'object' || Array.isArray(data.tracking)) {
-            errors.push('tracking must be an object');
-        } else {
-            const trackingFields = ['kills', 'vehicleKills', 'purchases', 'weaponXp', 'rewards'];
-            for (const field of trackingFields) {
-                if (data.tracking[field] !== undefined) {
-                    if (typeof data.tracking[field] !== 'object' || Array.isArray(data.tracking[field])) {
-                        errors.push(`tracking.${field} must be an object`);
+    return {
+        valid: errors.length === 0,
+        errors
+    };
+}
+
+/**
+ * Validate tracking data in v2 format.
+ * Tracking is now embedded in the player JSON (data.tracking section).
+ * This validates the tracking object structure.
+ *
+ * @param {Object} data - Tracking data object (must include v, steamId, and tracking fields)
+ * @returns {{valid: boolean, errors: string[]}}
+ */
+export function validateV2TrackingFormat(data) {
+    const errors = [];
+
+    // Check top-level structure
+    if (!data || typeof data !== 'object') {
+        errors.push('Tracking data must be an object');
+        return { valid: false, errors };
+    }
+
+    // Check version
+    if (data.v !== 2) {
+        errors.push(`Invalid version: expected 2, got ${data.v}`);
+    }
+
+    // Validate Steam ID (required)
+    const steamIdResult = validateSteamId(data.steamId);
+    if (!steamIdResult.valid) {
+        errors.push(steamIdResult.error);
+    }
+
+    // Validate tracking fields (all should be objects with string keys and number values)
+    const trackingFields = ['kills', 'vehicleKills', 'purchases', 'weaponXp', 'rewards'];
+    for (const field of trackingFields) {
+        if (data[field] !== undefined) {
+            if (typeof data[field] !== 'object' || Array.isArray(data[field])) {
+                errors.push(`${field} must be an object`);
+            } else {
+                // Validate values are numbers
+                for (const [key, value] of Object.entries(data[field])) {
+                    if (typeof value !== 'number') {
+                        errors.push(`${field}.${key} must be a number`);
+                    } else if (value < 0) {
+                        errors.push(`${field}.${key} cannot be negative`);
                     }
                 }
             }
@@ -146,6 +185,43 @@ export function validateV2Format(data) {
         valid: errors.length === 0,
         errors
     };
+}
+
+/**
+ * Validate combined player + tracking data in v2 format.
+ * Legacy function for backwards compatibility.
+ *
+ * @param {Object} data - Player data in v2 format (may include tracking)
+ * @returns {{valid: boolean, errors: string[]}}
+ */
+export function validateV2Format(data) {
+    // If split format, validate separately
+    if (data && data.player && data.tracking) {
+        const playerResult = validateV2PlayerFormat(data.player);
+        const trackingResult = validateV2TrackingFormat(data.tracking);
+        return {
+            valid: playerResult.valid && trackingResult.valid,
+            errors: [...playerResult.errors, ...trackingResult.errors]
+        };
+    }
+
+    // Otherwise validate as player format (may have embedded tracking)
+    const playerResult = validateV2PlayerFormat(data);
+
+    // If there's embedded tracking, validate it too
+    if (data && data.tracking) {
+        const trackingResult = validateV2TrackingFormat({
+            v: 2,
+            steamId: data.steamId,
+            ...data.tracking
+        });
+        return {
+            valid: playerResult.valid && trackingResult.valid,
+            errors: [...playerResult.errors, ...trackingResult.errors]
+        };
+    }
+
+    return playerResult;
 }
 
 /**
@@ -304,6 +380,8 @@ export default {
     DELTA_LIMITS,
     validateSteamId,
     validateV2Format,
+    validateV2PlayerFormat,
+    validateV2TrackingFormat,
     checkDeltaLimits,
     validateSyncSequence,
     sanitizeString,

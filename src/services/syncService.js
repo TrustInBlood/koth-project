@@ -1,8 +1,15 @@
 import { getModels } from '../database/models/index.js';
 import databaseManager from '../database/index.js';
 import { createServiceLogger } from '../utils/logger.js';
-import { dbToV2, v2ToDbParts, createDataSummary } from './gameDataTransformer.js';
-import { validateV2Format, checkDeltaLimits, validateSyncSequence, createDefaultPlayerData } from './dataValidator.js';
+import {
+    dbToV2,
+    dbToV2Player,
+    dbToV2Tracking,
+    v2PlayerToDbParts,
+    v2TrackingToDbParts,
+    createDataSummary
+} from './gameDataTransformer.js';
+import { validateV2PlayerFormat, validateV2TrackingFormat, checkDeltaLimits, validateSyncSequence } from './dataValidator.js';
 
 const logger = createServiceLogger('SyncService');
 
@@ -83,8 +90,10 @@ export async function handlePlayerConnect(steamId, server) {
         // Set this server as active
         await player.setActiveServer(server.server_id);
 
-        // Transform to v2 format
-        const v2Data = dbToV2(player);
+        // Transform to v2 format (player only - game doesn't need historical tracking)
+        // Tracking data is for leaderboards/stats on web dashboard
+        // Game builds tracking fresh during play session
+        const playerData = dbToV2Player(player);
 
         const duration = Date.now() - startTime;
         logger.info(`Player connect: ${steamId} on ${server.server_id} (${duration}ms)`);
@@ -97,14 +106,15 @@ export async function handlePlayerConnect(steamId, server) {
             syncSeqBefore: null,
             syncSeqAfter: player.sync_seq,
             dataBefore: null,
-            dataAfter: createDataSummary(v2Data),
+            dataAfter: createDataSummary(playerData),
             durationMs: duration
         });
 
         return {
             success: true,
             status: 'ok',
-            data: v2Data,
+            player: playerData,
+            // Note: No tracking sent on connect - game builds it fresh
             syncSeq: Number(player.sync_seq)
         };
 
@@ -115,27 +125,45 @@ export async function handlePlayerConnect(steamId, server) {
 }
 
 /**
- * Handle periodic sync during gameplay
+ * Handle periodic sync during gameplay (full data: player + tracking)
+ * Tracking is synced periodically to protect against crash data loss.
  *
- * @param {Object} v2Data - Player data in v2 format
+ * @param {Object} data - Full v2 data with player fields + tracking section
  * @param {Object} server - GameServer record
  * @returns {Promise<Object>} Sync result
  */
-export async function handlePeriodicSync(v2Data, server) {
+export async function handlePeriodicSync(data, server) {
     const models = getModels();
     const sequelize = databaseManager.getSequelize();
     const startTime = Date.now();
-    const steamId = v2Data.steamId;
 
-    // Validate v2 format
-    const validation = validateV2Format(v2Data);
+    // Extract player data and tracking from combined format
+    const playerData = data;
+    const trackingData = data.tracking || null;
+    const steamId = playerData.steamId;
+
+    // Validate v2 player format
+    const validation = validateV2PlayerFormat(playerData);
     if (!validation.valid) {
-        logger.warn(`Invalid v2 data from ${server.server_id} for ${steamId}: ${validation.errors.join(', ')}`);
+        logger.warn(`Invalid v2 player data from ${server.server_id} for ${steamId}: ${validation.errors.join(', ')}`);
         return {
             success: false,
             error: 'validation_failed',
             errors: validation.errors
         };
+    }
+
+    // Validate tracking data if provided
+    if (trackingData) {
+        const trackingValidation = validateV2TrackingFormat({ v: 2, steamId, ...trackingData });
+        if (!trackingValidation.valid) {
+            logger.warn(`Invalid v2 tracking data from ${server.server_id} for ${steamId}: ${trackingValidation.errors.join(', ')}`);
+            return {
+                success: false,
+                error: 'tracking_validation_failed',
+                errors: trackingValidation.errors
+            };
+        }
     }
 
     const transaction = await sequelize.transaction();
@@ -164,7 +192,7 @@ export async function handlePeriodicSync(v2Data, server) {
         }
 
         // Validate sync sequence
-        const seqValidation = validateSyncSequence(Number(player.sync_seq), v2Data.syncSeq);
+        const seqValidation = validateSyncSequence(Number(player.sync_seq), playerData.syncSeq);
         if (!seqValidation.valid) {
             await transaction.rollback();
             logger.warn(`Invalid syncSeq from ${server.server_id} for ${steamId}: ${seqValidation.reason}`);
@@ -177,10 +205,10 @@ export async function handlePeriodicSync(v2Data, server) {
         }
 
         // Get old data for delta check
-        const oldV2Data = dbToV2(player);
+        const oldPlayerData = dbToV2Player(player);
 
-        // Check delta limits
-        const deltaCheck = checkDeltaLimits(oldV2Data, v2Data);
+        // Check delta limits (player data only)
+        const deltaCheck = checkDeltaLimits(oldPlayerData, playerData);
         let flagged = false;
         let flagReason = null;
 
@@ -191,14 +219,14 @@ export async function handlePeriodicSync(v2Data, server) {
             logger.warn(`Delta violation from ${server.server_id} for ${steamId}: ${flagReason}`);
         }
 
-        // Extract parts for database upsert
-        const dbParts = v2ToDbParts(v2Data);
+        // Extract parts for database upsert (player data only)
+        const dbParts = v2PlayerToDbParts(playerData);
 
         // Update player record
         await player.update({
             eos_id: dbParts.player.eos_id || player.eos_id,
             name: dbParts.player.name || player.name,
-            sync_seq: v2Data.syncSeq
+            sync_seq: playerData.syncSeq
         }, { transaction });
 
         // Upsert stats
@@ -251,44 +279,49 @@ export async function handlePeriodicSync(v2Data, server) {
             }, { transaction });
         }
 
-        // Upsert rewards
-        for (const reward of dbParts.rewards) {
-            await models.PlayerReward.upsert({
-                player_id: player.id,
-                ...reward
-            }, { transaction });
-        }
+        // === Sync tracking data (for crash protection) ===
+        if (trackingData) {
+            const trackingParts = v2TrackingToDbParts({ v: 2, steamId, ...trackingData });
 
-        // Upsert kills
-        for (const kill of dbParts.kills) {
-            await models.PlayerKill.upsert({
-                killer_id: player.id,
-                ...kill
-            }, { transaction });
-        }
+            // Upsert rewards
+            for (const reward of trackingParts.rewards) {
+                await models.PlayerReward.upsert({
+                    player_id: player.id,
+                    ...reward
+                }, { transaction });
+            }
 
-        // Upsert vehicle kills
-        for (const vk of dbParts.vehicleKills) {
-            await models.PlayerVehicleKill.upsert({
-                player_id: player.id,
-                ...vk
-            }, { transaction });
-        }
+            // Upsert kills
+            for (const kill of trackingParts.kills) {
+                await models.PlayerKill.upsert({
+                    killer_id: player.id,
+                    ...kill
+                }, { transaction });
+            }
 
-        // Upsert purchases
-        for (const purchase of dbParts.purchases) {
-            await models.PlayerPurchase.upsert({
-                player_id: player.id,
-                ...purchase
-            }, { transaction });
-        }
+            // Upsert vehicle kills
+            for (const vk of trackingParts.vehicleKills) {
+                await models.PlayerVehicleKill.upsert({
+                    player_id: player.id,
+                    ...vk
+                }, { transaction });
+            }
 
-        // Upsert weapon xp
-        for (const wxp of dbParts.weaponXp) {
-            await models.PlayerWeaponXp.upsert({
-                player_id: player.id,
-                ...wxp
-            }, { transaction });
+            // Upsert purchases
+            for (const purchase of trackingParts.purchases) {
+                await models.PlayerPurchase.upsert({
+                    player_id: player.id,
+                    ...purchase
+                }, { transaction });
+            }
+
+            // Upsert weapon xp
+            for (const wxp of trackingParts.weaponXp) {
+                await models.PlayerWeaponXp.upsert({
+                    player_id: player.id,
+                    ...wxp
+                }, { transaction });
+            }
         }
 
         await transaction.commit();
@@ -301,19 +334,19 @@ export async function handlePeriodicSync(v2Data, server) {
             playerSteamId: steamId,
             syncType: 'periodic',
             syncSeqBefore: Number(player.sync_seq),
-            syncSeqAfter: v2Data.syncSeq,
-            dataBefore: createDataSummary(oldV2Data),
-            dataAfter: createDataSummary(v2Data),
+            syncSeqAfter: playerData.syncSeq,
+            dataBefore: createDataSummary(oldPlayerData),
+            dataAfter: createDataSummary(playerData),
             flagged,
             flagReason,
             durationMs: duration
         });
 
-        logger.info(`Periodic sync: ${steamId} seq ${v2Data.syncSeq} (${duration}ms)${flagged ? ' [FLAGGED]' : ''}`);
+        logger.info(`Periodic sync: ${steamId} seq ${playerData.syncSeq} (${duration}ms)${trackingData ? ' +tracking' : ''}${flagged ? ' [FLAGGED]' : ''}`);
 
         return {
             success: true,
-            syncSeq: v2Data.syncSeq,
+            syncSeq: playerData.syncSeq,
             flagged
         };
 
@@ -325,30 +358,202 @@ export async function handlePeriodicSync(v2Data, server) {
 }
 
 /**
- * Handle player disconnect - final sync and release lock
+ * Handle player disconnect - sync player data, tracking data, and release lock
  *
- * @param {Object} v2Data - Final player data in v2 format
+ * @param {Object} data - Combined v2 format with tracking embedded
  * @param {Object} server - GameServer record
  * @returns {Promise<Object>} Disconnect result
  */
-export async function handlePlayerDisconnect(v2Data, server) {
+export async function handlePlayerDisconnect(data, server) {
     const models = getModels();
-    const steamId = v2Data.steamId;
+    const sequelize = databaseManager.getSequelize();
+    // Combined format: full player JSON with tracking embedded
+    const playerData = data;
+    const trackingData = data.tracking || null;
+    const steamId = playerData.steamId;
     const startTime = Date.now();
 
-    try {
-        // Perform final sync
-        const syncResult = await handlePeriodicSync(v2Data, server);
+    // Validate player data
+    const playerValidation = validateV2PlayerFormat(playerData);
+    if (!playerValidation.valid) {
+        logger.warn(`Invalid player data on disconnect from ${server.server_id} for ${steamId}`);
+        return {
+            success: false,
+            error: 'validation_failed',
+            errors: playerValidation.errors
+        };
+    }
 
-        if (!syncResult.success) {
-            return syncResult;
+    // Validate tracking data if provided
+    if (trackingData) {
+        const trackingValidation = validateV2TrackingFormat(trackingData);
+        if (!trackingValidation.valid) {
+            logger.warn(`Invalid tracking data on disconnect from ${server.server_id} for ${steamId}`);
+            return {
+                success: false,
+                error: 'tracking_validation_failed',
+                errors: trackingValidation.errors
+            };
+        }
+    }
+
+    const transaction = await sequelize.transaction();
+
+    try {
+        // Get current player
+        const player = await models.Player.findWithFullData(steamId);
+
+        if (!player) {
+            await transaction.rollback();
+            return {
+                success: false,
+                error: 'player_not_found'
+            };
+        }
+
+        // Verify this server owns the player session
+        if (player.active_server_id !== server.server_id) {
+            await transaction.rollback();
+            logger.warn(`Server ${server.server_id} tried to disconnect ${steamId} but ${player.active_server_id} owns session`);
+            return {
+                success: false,
+                error: 'not_session_owner',
+                activeServer: player.active_server_id
+            };
+        }
+
+        // Validate sync sequence
+        const seqValidation = validateSyncSequence(Number(player.sync_seq), playerData.syncSeq);
+        if (!seqValidation.valid) {
+            await transaction.rollback();
+            logger.warn(`Invalid syncSeq on disconnect from ${server.server_id} for ${steamId}: ${seqValidation.reason}`);
+            return {
+                success: false,
+                error: 'invalid_sync_seq',
+                reason: seqValidation.reason,
+                expectedSeq: Number(player.sync_seq)
+            };
+        }
+
+        // Get old data for delta check
+        const oldPlayerData = dbToV2Player(player);
+
+        // Check delta limits
+        const deltaCheck = checkDeltaLimits(oldPlayerData, playerData);
+        let flagged = false;
+        let flagReason = null;
+
+        if (!deltaCheck.valid) {
+            flagged = true;
+            flagReason = deltaCheck.violations.join('; ');
+            logger.warn(`Delta violation on disconnect from ${server.server_id} for ${steamId}: ${flagReason}`);
+        }
+
+        // === Sync player data ===
+        const dbParts = v2PlayerToDbParts(playerData);
+
+        await player.update({
+            eos_id: dbParts.player.eos_id || player.eos_id,
+            name: dbParts.player.name || player.name,
+            sync_seq: playerData.syncSeq
+        }, { transaction });
+
+        if (dbParts.stats) {
+            await models.PlayerStats.upsert({
+                player_id: player.id,
+                ...dbParts.stats
+            }, { transaction });
+        }
+
+        if (dbParts.skins) {
+            await models.PlayerSkin.upsert({
+                player_id: player.id,
+                ...dbParts.skins
+            }, { transaction });
+        }
+
+        if (dbParts.supporterStatus) {
+            await models.PlayerSupporterStatus.upsert({
+                player_id: player.id,
+                ...dbParts.supporterStatus
+            }, { transaction });
+        }
+
+        await models.LoadoutSlot.destroy({ where: { player_id: player.id }, transaction });
+        for (const slot of dbParts.loadout) {
+            await models.LoadoutSlot.create({
+                player_id: player.id,
+                ...slot
+            }, { transaction });
+        }
+
+        await models.PlayerPerk.destroy({ where: { player_id: player.id }, transaction });
+        for (const perk of dbParts.perks) {
+            await models.PlayerPerk.create({
+                player_id: player.id,
+                ...perk
+            }, { transaction });
+        }
+
+        for (const unlock of dbParts.permaUnlocks) {
+            await models.PlayerPermanentUnlock.upsert({
+                player_id: player.id,
+                ...unlock
+            }, { transaction });
+        }
+
+        // === Sync tracking data (only on disconnect) ===
+        if (trackingData) {
+            const trackingParts = v2TrackingToDbParts(trackingData);
+
+            // Upsert rewards
+            for (const reward of trackingParts.rewards) {
+                await models.PlayerReward.upsert({
+                    player_id: player.id,
+                    ...reward
+                }, { transaction });
+            }
+
+            // Upsert kills
+            for (const kill of trackingParts.kills) {
+                await models.PlayerKill.upsert({
+                    killer_id: player.id,
+                    ...kill
+                }, { transaction });
+            }
+
+            // Upsert vehicle kills
+            for (const vk of trackingParts.vehicleKills) {
+                await models.PlayerVehicleKill.upsert({
+                    player_id: player.id,
+                    ...vk
+                }, { transaction });
+            }
+
+            // Upsert purchases
+            for (const purchase of trackingParts.purchases) {
+                await models.PlayerPurchase.upsert({
+                    player_id: player.id,
+                    ...purchase
+                }, { transaction });
+            }
+
+            // Upsert weapon xp
+            for (const wxp of trackingParts.weaponXp) {
+                await models.PlayerWeaponXp.upsert({
+                    player_id: player.id,
+                    ...wxp
+                }, { transaction });
+            }
         }
 
         // Clear active server lock
-        const player = await models.Player.findOne({ where: { steam_id: steamId } });
-        if (player) {
-            await player.clearActiveServer();
-        }
+        await player.update({
+            active_server_id: null,
+            active_since: null
+        }, { transaction });
+
+        await transaction.commit();
 
         const duration = Date.now() - startTime;
 
@@ -357,21 +562,25 @@ export async function handlePlayerDisconnect(v2Data, server) {
             serverId: server.server_id,
             playerSteamId: steamId,
             syncType: 'disconnect',
-            syncSeqBefore: syncResult.syncSeq,
-            syncSeqAfter: syncResult.syncSeq,
-            dataBefore: null,
-            dataAfter: createDataSummary(v2Data),
+            syncSeqBefore: Number(player.sync_seq),
+            syncSeqAfter: playerData.syncSeq,
+            dataBefore: createDataSummary(oldPlayerData),
+            dataAfter: createDataSummary(playerData),
+            flagged,
+            flagReason,
             durationMs: duration
         });
 
-        logger.info(`Player disconnect: ${steamId} from ${server.server_id} (${duration}ms)`);
+        logger.info(`Player disconnect: ${steamId} from ${server.server_id} (${duration}ms)${trackingData ? ' +tracking' : ''}${flagged ? ' [FLAGGED]' : ''}`);
 
         return {
             success: true,
-            syncSeq: syncResult.syncSeq
+            syncSeq: playerData.syncSeq,
+            flagged
         };
 
     } catch (error) {
+        await transaction.rollback();
         logger.error(`Disconnect failed for ${steamId}: ${error.message}`, error.stack);
         throw error;
     }
@@ -380,24 +589,41 @@ export async function handlePlayerDisconnect(v2Data, server) {
 /**
  * Handle crash recovery sync - process orphaned player files
  *
- * @param {Object} v2Data - Player data recovered from crash
+ * @param {Object} data - Combined v2 format with tracking embedded
  * @param {Object} server - GameServer record
  * @returns {Promise<Object>} Recovery result
  */
-export async function handleCrashRecovery(v2Data, server) {
+export async function handleCrashRecovery(data, server) {
     const models = getModels();
-    const steamId = v2Data.steamId;
+    const sequelize = databaseManager.getSequelize();
+    // Combined format: full player JSON with tracking embedded
+    const playerData = data;
+    const trackingData = data.tracking || null;
+    const steamId = playerData.steamId;
     const startTime = Date.now();
 
-    // Validate v2 format
-    const validation = validateV2Format(v2Data);
-    if (!validation.valid) {
-        logger.warn(`Invalid crash recovery data from ${server.server_id} for ${steamId}`);
+    // Validate player data
+    const playerValidation = validateV2PlayerFormat(playerData);
+    if (!playerValidation.valid) {
+        logger.warn(`Invalid crash recovery player data from ${server.server_id} for ${steamId}`);
         return {
             success: false,
             error: 'validation_failed',
-            errors: validation.errors
+            errors: playerValidation.errors
         };
+    }
+
+    // Validate tracking data if provided
+    if (trackingData) {
+        const trackingValidation = validateV2TrackingFormat(trackingData);
+        if (!trackingValidation.valid) {
+            logger.warn(`Invalid crash recovery tracking data from ${server.server_id} for ${steamId}`);
+            return {
+                success: false,
+                error: 'tracking_validation_failed',
+                errors: trackingValidation.errors
+            };
+        }
     }
 
     try {
@@ -413,8 +639,7 @@ export async function handleCrashRecovery(v2Data, server) {
         }
 
         // For crash recovery, we're more lenient with sequence numbers
-        // Just check it's not way off
-        const seqValidation = validateSyncSequence(Number(player.sync_seq), v2Data.syncSeq, 100);
+        const seqValidation = validateSyncSequence(Number(player.sync_seq), playerData.syncSeq, 100);
         let flagged = false;
         let flagReason = null;
 
@@ -423,9 +648,9 @@ export async function handleCrashRecovery(v2Data, server) {
             flagReason = `Crash recovery seq mismatch: ${seqValidation.reason}`;
         }
 
-        // Check delta limits (still enforce)
-        const oldV2Data = dbToV2(player);
-        const deltaCheck = checkDeltaLimits(oldV2Data, v2Data);
+        // Check delta limits
+        const oldPlayerData = dbToV2Player(player);
+        const deltaCheck = checkDeltaLimits(oldPlayerData, playerData);
 
         if (!deltaCheck.valid) {
             flagged = true;
@@ -433,8 +658,8 @@ export async function handleCrashRecovery(v2Data, server) {
         }
 
         // If the recovered data is older than DB, skip it
-        if (v2Data.syncSeq < Number(player.sync_seq)) {
-            logger.info(`Crash recovery skipped for ${steamId}: recovered seq ${v2Data.syncSeq} < db seq ${player.sync_seq}`);
+        if (playerData.syncSeq < Number(player.sync_seq)) {
+            logger.info(`Crash recovery skipped for ${steamId}: recovered seq ${playerData.syncSeq} < db seq ${player.sync_seq}`);
             return {
                 success: true,
                 skipped: true,
@@ -445,21 +670,18 @@ export async function handleCrashRecovery(v2Data, server) {
         // Clear active server (the crash implies the old session is dead)
         await player.clearActiveServer();
 
-        // Perform the sync using periodic sync logic (without ownership check)
-        const sequelize = databaseManager.getSequelize();
         const transaction = await sequelize.transaction();
 
         try {
-            const dbParts = v2ToDbParts(v2Data);
+            // === Sync player data ===
+            const dbParts = v2PlayerToDbParts(playerData);
 
-            // Update player
             await player.update({
                 eos_id: dbParts.player.eos_id || player.eos_id,
                 name: dbParts.player.name || player.name,
-                sync_seq: v2Data.syncSeq
+                sync_seq: playerData.syncSeq
             }, { transaction });
 
-            // Upsert stats
             if (dbParts.stats) {
                 await models.PlayerStats.upsert({
                     player_id: player.id,
@@ -467,12 +689,81 @@ export async function handleCrashRecovery(v2Data, server) {
                 }, { transaction });
             }
 
-            // Upsert skins
             if (dbParts.skins) {
                 await models.PlayerSkin.upsert({
                     player_id: player.id,
                     ...dbParts.skins
                 }, { transaction });
+            }
+
+            if (dbParts.supporterStatus) {
+                await models.PlayerSupporterStatus.upsert({
+                    player_id: player.id,
+                    ...dbParts.supporterStatus
+                }, { transaction });
+            }
+
+            await models.LoadoutSlot.destroy({ where: { player_id: player.id }, transaction });
+            for (const slot of dbParts.loadout) {
+                await models.LoadoutSlot.create({
+                    player_id: player.id,
+                    ...slot
+                }, { transaction });
+            }
+
+            await models.PlayerPerk.destroy({ where: { player_id: player.id }, transaction });
+            for (const perk of dbParts.perks) {
+                await models.PlayerPerk.create({
+                    player_id: player.id,
+                    ...perk
+                }, { transaction });
+            }
+
+            for (const unlock of dbParts.permaUnlocks) {
+                await models.PlayerPermanentUnlock.upsert({
+                    player_id: player.id,
+                    ...unlock
+                }, { transaction });
+            }
+
+            // === Sync tracking data if provided ===
+            if (trackingData) {
+                const trackingParts = v2TrackingToDbParts(trackingData);
+
+                for (const reward of trackingParts.rewards) {
+                    await models.PlayerReward.upsert({
+                        player_id: player.id,
+                        ...reward
+                    }, { transaction });
+                }
+
+                for (const kill of trackingParts.kills) {
+                    await models.PlayerKill.upsert({
+                        killer_id: player.id,
+                        ...kill
+                    }, { transaction });
+                }
+
+                for (const vk of trackingParts.vehicleKills) {
+                    await models.PlayerVehicleKill.upsert({
+                        player_id: player.id,
+                        ...vk
+                    }, { transaction });
+                }
+
+                for (const purchase of trackingParts.purchases) {
+                    await models.PlayerPurchase.upsert({
+                        player_id: player.id,
+                        ...purchase
+                    }, { transaction });
+                }
+
+                for (const wxp of trackingParts.weaponXp) {
+                    await models.PlayerWeaponXp.upsert({
+                        player_id: player.id,
+                        ...wxp
+                    }, { transaction });
+                }
             }
 
             await transaction.commit();
@@ -489,19 +780,19 @@ export async function handleCrashRecovery(v2Data, server) {
             playerSteamId: steamId,
             syncType: 'crash_recovery',
             syncSeqBefore: Number(player.sync_seq),
-            syncSeqAfter: v2Data.syncSeq,
-            dataBefore: createDataSummary(oldV2Data),
-            dataAfter: createDataSummary(v2Data),
+            syncSeqAfter: playerData.syncSeq,
+            dataBefore: createDataSummary(oldPlayerData),
+            dataAfter: createDataSummary(playerData),
             flagged,
             flagReason,
             durationMs: duration
         });
 
-        logger.info(`Crash recovery: ${steamId} (${duration}ms)${flagged ? ' [FLAGGED]' : ''}`);
+        logger.info(`Crash recovery: ${steamId} (${duration}ms)${trackingData ? ' +tracking' : ''}${flagged ? ' [FLAGGED]' : ''}`);
 
         return {
             success: true,
-            syncSeq: v2Data.syncSeq,
+            syncSeq: playerData.syncSeq,
             flagged
         };
 

@@ -22,7 +22,7 @@ import {
     handlePlayerDisconnect,
     handleCrashRecovery
 } from './syncService.js';
-import { validateV2Format } from './dataValidator.js';
+import { validateV2PlayerFormat, validateV2TrackingFormat } from './dataValidator.js';
 import { getModels } from '../database/models/index.js';
 
 const logger = createServiceLogger('GameServerConnector');
@@ -171,10 +171,11 @@ function connectToGameServer(serverConfig) {
                 return;
             }
 
-            // Send player data
+            // Send player data only (no tracking - game builds tracking fresh)
+            // Tracking data is for leaderboards/stats on web dashboard
             socket.emit('player:data', {
                 steamId,
-                data: result.data,
+                player: result.player,
                 syncSeq: result.syncSeq
             });
 
@@ -194,8 +195,8 @@ function connectToGameServer(serverConfig) {
 
         const { steamId } = data;
 
-        // Validate v2 format
-        const validation = validateV2Format(data);
+        // Validate v2 player format (combined format with optional tracking)
+        const validation = validateV2PlayerFormat(data);
         if (!validation.valid) {
             logger.warn(`Invalid sync data from ${connectionInfo.serverName} for ${steamId}`);
             socket.emit('sync:error', {
@@ -206,7 +207,22 @@ function connectToGameServer(serverConfig) {
             return;
         }
 
+        // Validate tracking data if provided
+        if (data.tracking) {
+            const trackingValidation = validateV2TrackingFormat({ v: 2, steamId, ...data.tracking });
+            if (!trackingValidation.valid) {
+                logger.warn(`Invalid tracking data from ${connectionInfo.serverName} for ${steamId}`);
+                socket.emit('sync:error', {
+                    steamId,
+                    error: 'tracking_validation_failed',
+                    errors: trackingValidation.errors
+                });
+                return;
+            }
+        }
+
         try {
+            // Pass combined data to sync service (includes tracking if present)
             const result = await handlePeriodicSync(data, connectionInfo.serverRecord);
 
             if (!result.success) {
@@ -238,21 +254,37 @@ function connectToGameServer(serverConfig) {
             return;
         }
 
-        const { steamId } = data;
+        // Combined format: data is full player JSON with tracking embedded
+        const steamId = data.steamId;
 
-        // Validate v2 format
-        const validation = validateV2Format(data);
-        if (!validation.valid) {
-            logger.warn(`Invalid disconnect data from ${connectionInfo.serverName} for ${steamId}`);
+        // Validate player data
+        const playerValidation = validateV2PlayerFormat(data);
+        if (!playerValidation.valid) {
+            logger.warn(`Invalid disconnect player data from ${connectionInfo.serverName} for ${steamId}`);
             socket.emit('disconnect:error', {
                 steamId,
                 error: 'validation_failed',
-                errors: validation.errors
+                errors: playerValidation.errors
             });
             return;
         }
 
+        // Validate tracking data if provided
+        if (data.tracking) {
+            const trackingValidation = validateV2TrackingFormat({ v: 2, steamId, ...data.tracking });
+            if (!trackingValidation.valid) {
+                logger.warn(`Invalid disconnect tracking data from ${connectionInfo.serverName} for ${steamId}`);
+                socket.emit('disconnect:error', {
+                    steamId,
+                    error: 'tracking_validation_failed',
+                    errors: trackingValidation.errors
+                });
+                return;
+            }
+        }
+
         try {
+            // Pass combined format - handlePlayerDisconnect extracts tracking
             const result = await handlePlayerDisconnect(data, connectionInfo.serverRecord);
 
             if (!result.success) {
@@ -283,21 +315,37 @@ function connectToGameServer(serverConfig) {
             return;
         }
 
-        const { steamId } = data;
+        // Combined format: full player JSON with tracking embedded
+        const steamId = data.steamId;
 
-        // Validate v2 format
-        const validation = validateV2Format(data);
-        if (!validation.valid) {
-            logger.warn(`Invalid crash recovery data from ${connectionInfo.serverName} for ${steamId}`);
+        // Validate player data
+        const playerValidation = validateV2PlayerFormat(data);
+        if (!playerValidation.valid) {
+            logger.warn(`Invalid crash recovery player data from ${connectionInfo.serverName} for ${steamId}`);
             socket.emit('recovery:error', {
                 steamId,
                 error: 'validation_failed',
-                errors: validation.errors
+                errors: playerValidation.errors
             });
             return;
         }
 
+        // Validate tracking data if provided
+        if (data.tracking) {
+            const trackingValidation = validateV2TrackingFormat({ v: 2, steamId, ...data.tracking });
+            if (!trackingValidation.valid) {
+                logger.warn(`Invalid crash recovery tracking data from ${connectionInfo.serverName} for ${steamId}`);
+                socket.emit('recovery:error', {
+                    steamId,
+                    error: 'tracking_validation_failed',
+                    errors: trackingValidation.errors
+                });
+                return;
+            }
+        }
+
         try {
+            // Pass combined format - handleCrashRecovery extracts tracking
             const result = await handleCrashRecovery(data, connectionInfo.serverRecord);
 
             if (!result.success) {
@@ -341,17 +389,28 @@ function connectToGameServer(serverConfig) {
 
         const results = [];
 
-        for (const playerData of players) {
-            const { steamId } = playerData;
+        for (const playerJson of players) {
+            // Combined format: full player JSON with tracking embedded
+            const steamId = playerJson.steamId;
 
             try {
-                const validation = validateV2Format(playerData);
-                if (!validation.valid) {
+                // Validate player data
+                const playerValidation = validateV2PlayerFormat(playerJson);
+                if (!playerValidation.valid) {
                     results.push({ steamId, success: false, error: 'validation_failed' });
                     continue;
                 }
 
-                const result = await handleCrashRecovery(playerData, connectionInfo.serverRecord);
+                // Validate tracking data if provided
+                if (playerJson.tracking) {
+                    const trackingValidation = validateV2TrackingFormat({ v: 2, steamId, ...playerJson.tracking });
+                    if (!trackingValidation.valid) {
+                        results.push({ steamId, success: false, error: 'tracking_validation_failed' });
+                        continue;
+                    }
+                }
+
+                const result = await handleCrashRecovery(playerJson, connectionInfo.serverRecord);
                 results.push({
                     steamId,
                     success: result.success,

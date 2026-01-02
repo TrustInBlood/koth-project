@@ -3,12 +3,13 @@ import { createServiceLogger } from '../utils/logger.js';
 const logger = createServiceLogger('GameDataTransformer');
 
 /**
- * Transform database player record (with associations) to v2 JSON format.
+ * Transform database player record to v2 player JSON format.
+ * This is the PLAYER file only - no tracking data.
  *
  * @param {Object} player - Sequelize Player instance with associations
- * @returns {Object} Player data in v2 JSON format
+ * @returns {Object} Player data in v2 JSON format (no tracking)
  */
-export function dbToV2(player) {
+export function dbToV2Player(player) {
     if (!player) return null;
 
     const data = {
@@ -78,8 +79,22 @@ export function dbToV2(player) {
         data.supporterStatus = [];
     }
 
-    // Tracking objects
-    data.tracking = {
+    return data;
+}
+
+/**
+ * Transform database player record to v2 tracking JSON format.
+ * This is the TRACKING file only - kills, purchases, etc.
+ *
+ * @param {Object} player - Sequelize Player instance with associations
+ * @returns {Object} Tracking data in v2 JSON format
+ */
+export function dbToV2Tracking(player) {
+    if (!player) return null;
+
+    const data = {
+        v: 2,
+        steamId: player.steam_id,
         kills: {},
         vehicleKills: {},
         purchases: {},
@@ -89,40 +104,59 @@ export function dbToV2(player) {
 
     // Kills: { victimSteamId: count }
     for (const kill of (player.kills || [])) {
-        data.tracking.kills[kill.victim_steam_id] = kill.count || 0;
+        data.kills[kill.victim_steam_id] = kill.count || 0;
     }
 
     // Vehicle kills: { vehicleName: count }
     for (const vk of (player.vehicleKills || [])) {
-        data.tracking.vehicleKills[vk.vehicle_name] = vk.count || 0;
+        data.vehicleKills[vk.vehicle_name] = vk.count || 0;
     }
 
     // Purchases: { itemName: count }
     for (const p of (player.purchases || [])) {
-        data.tracking.purchases[p.item_name] = p.count || 0;
+        data.purchases[p.item_name] = p.count || 0;
     }
 
     // Weapon XP: { weaponName: xp }
     for (const wx of (player.weaponXp || [])) {
-        data.tracking.weaponXp[wx.weapon_name] = wx.xp || 0;
+        data.weaponXp[wx.weapon_name] = wx.xp || 0;
     }
 
     // Rewards: { rewardType: count }
     for (const r of (player.rewards || [])) {
-        data.tracking.rewards[r.reward_type] = r.count || 0;
+        data.rewards[r.reward_type] = r.count || 0;
     }
 
     return data;
 }
 
 /**
- * Extract data from v2 format for database upsert operations.
+ * Transform database player record to combined v2 format (player + tracking).
+ * Used for full data export or when both files need to be sent together.
+ *
+ * @param {Object} player - Sequelize Player instance with associations
+ * @returns {Object} Combined player and tracking data
+ */
+export function dbToV2(player) {
+    const playerData = dbToV2Player(player);
+    if (!playerData) return null;
+
+    const trackingData = dbToV2Tracking(player);
+
+    return {
+        player: playerData,
+        tracking: trackingData
+    };
+}
+
+/**
+ * Extract player data from v2 format for database upsert operations.
  * Returns separate objects for each table.
  *
- * @param {Object} v2Data - Player data in v2 format
- * @returns {Object} Extracted data for each table
+ * @param {Object} v2Data - Player data in v2 format (player file, no tracking)
+ * @returns {Object} Extracted data for player-related tables
  */
-export function v2ToDbParts(v2Data) {
+export function v2PlayerToDbParts(v2Data) {
     const result = {
         player: {
             steam_id: v2Data.steamId,
@@ -135,12 +169,7 @@ export function v2ToDbParts(v2Data) {
         supporterStatus: null,
         loadout: [],
         perks: [],
-        permaUnlocks: [],
-        rewards: [],
-        kills: [],
-        vehicleKills: [],
-        purchases: [],
-        weaponXp: []
+        permaUnlocks: []
     };
 
     // Stats
@@ -201,60 +230,99 @@ export function v2ToDbParts(v2Data) {
         }));
     }
 
-    // Tracking objects
-    if (v2Data.tracking) {
-        // Kills
-        if (v2Data.tracking.kills) {
-            for (const [victimSteamId, count] of Object.entries(v2Data.tracking.kills)) {
-                result.kills.push({
-                    victim_steam_id: victimSteamId,
-                    count: count || 0
-                });
-            }
-        }
+    return result;
+}
 
-        // Vehicle kills
-        if (v2Data.tracking.vehicleKills) {
-            for (const [vehicleName, count] of Object.entries(v2Data.tracking.vehicleKills)) {
-                result.vehicleKills.push({
-                    vehicle_name: vehicleName,
-                    count: count || 0
-                });
-            }
-        }
+/**
+ * Extract tracking data from v2 format for database upsert operations.
+ *
+ * @param {Object} trackingData - Tracking data in v2 format
+ * @returns {Object} Extracted data for tracking-related tables
+ */
+export function v2TrackingToDbParts(trackingData) {
+    const result = {
+        rewards: [],
+        kills: [],
+        vehicleKills: [],
+        purchases: [],
+        weaponXp: []
+    };
 
-        // Purchases
-        if (v2Data.tracking.purchases) {
-            for (const [itemName, count] of Object.entries(v2Data.tracking.purchases)) {
-                result.purchases.push({
-                    item_name: itemName,
-                    count: count || 0
-                });
-            }
-        }
+    if (!trackingData) return result;
 
-        // Weapon XP
-        if (v2Data.tracking.weaponXp) {
-            for (const [weaponName, xp] of Object.entries(v2Data.tracking.weaponXp)) {
-                result.weaponXp.push({
-                    weapon_name: weaponName,
-                    xp: xp || 0
-                });
-            }
+    // Kills
+    if (trackingData.kills) {
+        for (const [victimSteamId, count] of Object.entries(trackingData.kills)) {
+            result.kills.push({
+                victim_steam_id: victimSteamId,
+                count: count || 0
+            });
         }
+    }
 
-        // Rewards
-        if (v2Data.tracking.rewards) {
-            for (const [rewardType, count] of Object.entries(v2Data.tracking.rewards)) {
-                result.rewards.push({
-                    reward_type: rewardType,
-                    count: count || 0
-                });
-            }
+    // Vehicle kills
+    if (trackingData.vehicleKills) {
+        for (const [vehicleName, count] of Object.entries(trackingData.vehicleKills)) {
+            result.vehicleKills.push({
+                vehicle_name: vehicleName,
+                count: count || 0
+            });
+        }
+    }
+
+    // Purchases
+    if (trackingData.purchases) {
+        for (const [itemName, count] of Object.entries(trackingData.purchases)) {
+            result.purchases.push({
+                item_name: itemName,
+                count: count || 0
+            });
+        }
+    }
+
+    // Weapon XP
+    if (trackingData.weaponXp) {
+        for (const [weaponName, xp] of Object.entries(trackingData.weaponXp)) {
+            result.weaponXp.push({
+                weapon_name: weaponName,
+                xp: xp || 0
+            });
+        }
+    }
+
+    // Rewards
+    if (trackingData.rewards) {
+        for (const [rewardType, count] of Object.entries(trackingData.rewards)) {
+            result.rewards.push({
+                reward_type: rewardType,
+                count: count || 0
+            });
         }
     }
 
     return result;
+}
+
+/**
+ * Legacy function - extracts both player and tracking data.
+ * Use v2PlayerToDbParts and v2TrackingToDbParts for split format.
+ *
+ * @param {Object} v2Data - Combined v2 data or player data with tracking
+ * @returns {Object} Extracted data for all tables
+ */
+export function v2ToDbParts(v2Data) {
+    // Handle new split format
+    if (v2Data.player && v2Data.tracking) {
+        const playerParts = v2PlayerToDbParts(v2Data.player);
+        const trackingParts = v2TrackingToDbParts(v2Data.tracking);
+        return { ...playerParts, ...trackingParts };
+    }
+
+    // Handle legacy combined format (player file with tracking inside)
+    const playerParts = v2PlayerToDbParts(v2Data);
+    const trackingParts = v2TrackingToDbParts(v2Data.tracking || v2Data);
+
+    return { ...playerParts, ...trackingParts };
 }
 
 /**
@@ -266,20 +334,27 @@ export function v2ToDbParts(v2Data) {
 export function createDataSummary(v2Data) {
     if (!v2Data) return null;
 
+    // Handle split format
+    const playerData = v2Data.player || v2Data;
+
     return {
-        steamId: v2Data.steamId,
-        syncSeq: v2Data.syncSeq,
-        currency: v2Data.stats?.currency || 0,
-        xp: v2Data.stats?.xp || 0,
-        prestige: v2Data.stats?.prestige || 0,
-        loadoutCount: v2Data.loadout?.length || 0,
-        perksCount: v2Data.perks?.length || 0,
-        permaUnlocksCount: v2Data.permaUnlocks?.length || 0
+        steamId: playerData.steamId,
+        syncSeq: playerData.syncSeq,
+        currency: playerData.stats?.currency || 0,
+        xp: playerData.stats?.xp || 0,
+        prestige: playerData.stats?.prestige || 0,
+        loadoutCount: playerData.loadout?.length || 0,
+        perksCount: playerData.perks?.length || 0,
+        permaUnlocksCount: playerData.permaUnlocks?.length || 0
     };
 }
 
 export default {
     dbToV2,
+    dbToV2Player,
+    dbToV2Tracking,
     v2ToDbParts,
+    v2PlayerToDbParts,
+    v2TrackingToDbParts,
     createDataSummary
 };
