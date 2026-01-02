@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+
+# Environment files (keep examples)
+.env
+.env.production
+.env.development
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build outputs
+dist/
+dashboard/dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Database
+*.sqlite
+*.sqlite3
+
+# Secrets (just in case)
+*.pem
+*.key
+secrets/
