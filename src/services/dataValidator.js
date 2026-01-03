@@ -8,7 +8,7 @@ const logger = createServiceLogger('DataValidator');
  * If exceeded, the sync is flagged for review.
  */
 export const DELTA_LIMITS = {
-    currency: 50000,      // Max currency gain per sync
+    currencyTotal: 50000, // Max currency earned per sync
     currencySpent: 50000, // Max currency spent per sync
     xp: 100000,           // Max XP gain per sync
     prestige: 1,          // Max prestige gain per sync
@@ -68,8 +68,9 @@ export function validateV2PlayerFormat(data) {
             errors.push('stats must be an object');
         } else {
             // Validate numeric fields
+            // Note: 'currency' is derived (currencyTotal - currencySpent), not stored/transmitted
             const numericFields = [
-                'currency', 'currencyTotal', 'currencySpent',
+                'currencyTotal', 'currencySpent',
                 'xp', 'xpTotal', 'prestige', 'permaTokens',
                 'dailyClaims', 'gamesPlayed', 'timePlayed'
             ];
@@ -242,10 +243,10 @@ export function checkDeltaLimits(oldData, newData) {
     const oldStats = oldData.stats;
     const newStats = newData.stats;
 
-    // Check currency gain
-    const currencyGain = (newStats.currency || 0) - (oldStats.currency || 0);
-    if (currencyGain > DELTA_LIMITS.currency) {
-        reasons.push(`Currency gain ${currencyGain} exceeds limit ${DELTA_LIMITS.currency}`);
+    // Check currency total gain (lifetime earned)
+    const currencyTotalGain = (newStats.currencyTotal || 0) - (oldStats.currencyTotal || 0);
+    if (currencyTotalGain > DELTA_LIMITS.currencyTotal) {
+        reasons.push(`Currency total gain ${currencyTotalGain} exceeds limit ${DELTA_LIMITS.currencyTotal}`);
     }
 
     // Check currency spent
@@ -340,11 +341,8 @@ export function createDefaultPlayerData(steamId) {
         steamId,
         eosId: null,
         name: null,
-        serverId: null,
-        lastSync: new Date().toISOString(),
         syncSeq: 0,
         stats: {
-            currency: 0,
             currencyTotal: 0,
             currencySpent: 0,
             xp: 0,

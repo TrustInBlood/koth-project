@@ -493,8 +493,6 @@ export default class WsKothDB extends BasePlugin {
                 // Increment syncSeq for this sync
                 const newSyncSeq = (playerInfo.syncSeq || 0) + 1;
                 playerData.syncSeq = newSyncSeq;
-                playerData.serverId = this.options.serverId;
-                playerData.lastSync = new Date().toISOString();
 
                 // Update file with new syncSeq
                 await this.writePlayerJson(steamId, playerData);
@@ -656,8 +654,6 @@ export default class WsKothDB extends BasePlugin {
             const playerInfo = this.activePlayers.get(steamId);
             const newSyncSeq = ((playerInfo?.syncSeq) || (playerData.syncSeq) || 0) + 1;
             playerData.syncSeq = newSyncSeq;
-            playerData.serverId = this.options.serverId;
-            playerData.lastSync = new Date().toISOString();
 
             // Update file before sending
             await this.writePlayerJson(steamId, playerData);
@@ -741,7 +737,7 @@ export default class WsKothDB extends BasePlugin {
 
         if (this.options.dryRun) {
             this.verbose(1, `WsKothDB: [DRY RUN] Would write player file: ${filePath}`);
-            this.verbose(2, `WsKothDB: [DRY RUN] Data: v=${data.v}, syncSeq=${data.syncSeq}, currency=${data.stats?.currency}`);
+            this.verbose(2, `WsKothDB: [DRY RUN] Data: v=${data.v}, syncSeq=${data.syncSeq}, currencyTotal=${data.stats?.currencyTotal}`);
             return;
         }
 
@@ -819,17 +815,15 @@ export default class WsKothDB extends BasePlugin {
 
     createDefaultV2Save(steamId, eosId, name) {
         // Combined file - player data + embedded tracking (empty)
+        // Note: 'currency' is derived (currencyTotal - currencySpent), not stored
         return {
             v: 2,
             steamId: steamId,
             eosId: eosId || null,
             name: name || null,
-            serverId: this.options.serverId,
-            lastSync: new Date().toISOString(),
             syncSeq: 0,
 
             stats: {
-                currency: 0,
                 currencyTotal: 0,
                 currencySpent: 0,
                 xp: 0,

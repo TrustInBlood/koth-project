@@ -12,20 +12,19 @@ const logger = createServiceLogger('GameDataTransformer');
 export function dbToV2Player(player) {
     if (!player) return null;
 
+    // Note: serverId and lastSync removed - DB tracks these internally
+    // Note: currency is derived (currencyTotal - currencySpent), not stored/transmitted
     const data = {
         v: 2,
         steamId: player.steam_id,
         eosId: player.eos_id || null,
         name: player.name || null,
-        serverId: player.active_server_id || null,
-        lastSync: player.updated_at?.toISOString() || new Date().toISOString(),
         syncSeq: Number(player.sync_seq) || 0
     };
 
     // Stats
     if (player.stats) {
         data.stats = {
-            currency: player.stats.currency || 0,
             currencyTotal: Number(player.stats.currency_total) || 0,
             currencySpent: Number(player.stats.currency_spent) || 0,
             xp: player.stats.xp || 0,
@@ -40,7 +39,7 @@ export function dbToV2Player(player) {
         };
     } else {
         data.stats = {
-            currency: 0, currencyTotal: 0, currencySpent: 0,
+            currencyTotal: 0, currencySpent: 0,
             xp: 0, xpTotal: 0, prestige: 0, permaTokens: 0,
             dailyClaims: 0, gamesPlayed: 0, timePlayed: 0,
             joinTime: null, dailyClaimTime: null
@@ -173,9 +172,9 @@ export function v2PlayerToDbParts(v2Data) {
     };
 
     // Stats
+    // Note: 'currency' is derived (currencyTotal - currencySpent), not stored
     if (v2Data.stats) {
         result.stats = {
-            currency: v2Data.stats.currency || 0,
             currency_total: v2Data.stats.currencyTotal || 0,
             currency_spent: v2Data.stats.currencySpent || 0,
             xp: v2Data.stats.xp || 0,
@@ -337,10 +336,16 @@ export function createDataSummary(v2Data) {
     // Handle split format
     const playerData = v2Data.player || v2Data;
 
+    // Currency is derived: currencyTotal - currencySpent
+    const currencyTotal = playerData.stats?.currencyTotal || 0;
+    const currencySpent = playerData.stats?.currencySpent || 0;
+
     return {
         steamId: playerData.steamId,
         syncSeq: playerData.syncSeq,
-        currency: playerData.stats?.currency || 0,
+        currencyBalance: currencyTotal - currencySpent,
+        currencyTotal,
+        currencySpent,
         xp: playerData.stats?.xp || 0,
         prestige: playerData.stats?.prestige || 0,
         loadoutCount: playerData.loadout?.length || 0,
